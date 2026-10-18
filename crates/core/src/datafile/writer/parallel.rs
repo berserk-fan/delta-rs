@@ -122,6 +122,11 @@ pub(crate) struct ParallelArrowWriter<W: AsyncFileWriter> {
     /// The maximum number of rows to write to each row group, retrieved from [`WriterProperties`]
     max_rows_in_group_row: usize,
 
+    /// The maximum size of a row group in bytes, set from [`WriterProperties`].
+    /// Measured as the uncompressed row-group size that parquet records in the
+    /// file metadata; `usize::MAX` leaves row groups bounded by row count alone.
+    max_bytes_in_group_row: usize,
+
     /// Workers for the open row group; empty until the first write into it.
     workers: Vec<ColumnWorker>,
     buffered_rows: usize,
@@ -137,6 +142,9 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
     ) -> ParquetResult<Self> {
         let mut props = props;
         let options = options.unwrap_or_default();
+
+        // Taken from the writer properties, where an unset bound is unlimited.
+        let max_bytes_in_group_row = props.max_row_group_bytes().unwrap_or(usize::MAX);
 
         if !options.skip_arrow_metadata_hint {
             add_encoded_arrow_schema_to_metadata(&arrow_schema, &mut props);
@@ -159,6 +167,7 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
 
         Ok(Self {
             max_rows_in_group_row: props.max_row_group_row_count().unwrap_or(usize::MAX),
+            max_bytes_in_group_row,
             file_writer,
             factory: row_group_factory,
             sink_writer,
@@ -176,8 +185,12 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
                 self.start_row_group()?;
             }
 
+            // Recomputed after every close: the byte-capped count changes once a
+            // row group has been measured.
+            let max_rows_in_group_row =
+                self.max_rows_in_group_row.min(self.byte_capped_rows(batch));
             let length = usize::min(
-                self.max_rows_in_group_row - self.buffered_rows,
+                max_rows_in_group_row - self.buffered_rows,
                 batch.num_rows() - offset,
             );
             if length == batch.num_rows() {
@@ -188,7 +201,7 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
             offset += length;
 
             self.buffered_rows += length;
-            if self.buffered_rows >= self.max_rows_in_group_row {
+            if self.buffered_rows >= max_rows_in_group_row {
                 self.close_row_group().await?;
             }
         }
@@ -231,6 +244,37 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
 
     pub(crate) fn flushed_row_groups(&self) -> &[RowGroupMetaData] {
         self.file_writer.flushed_row_groups()
+    }
+
+    /// Rows a row group may hold to stay under [`Self::max_bytes_in_group_row`],
+    /// derived from the last row group that was closed; the first row group of a
+    /// file, having no earlier group to measure, is sized from the batch slice's
+    /// own memory rather than from the buffers it shares.
+    fn byte_capped_rows(&self, batch: &RecordBatch) -> usize {
+        if self.max_bytes_in_group_row == usize::MAX {
+            return usize::MAX;
+        }
+        let (rows, bytes) = match self.file_writer.flushed_row_groups().last() {
+            Some(group) => (
+                group.num_rows() as usize,
+                group.total_byte_size().max(0) as usize,
+            ),
+            // `get_array_memory_size` on a slice reports the whole backing buffer,
+            // so seed from the slice's own share where arrow can provide it; else
+            // the first row group of a file lands far under the bound.
+            None => (
+                batch.num_rows(),
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| column.to_data().get_slice_memory_size().ok())
+                    .sum::<Option<usize>>()
+                    .unwrap_or_else(|| batch.get_array_memory_size()),
+            ),
+        };
+        ((self.max_bytes_in_group_row as u128 * rows as u128 / bytes.max(1) as u128)
+            .min(usize::MAX as u128) as usize)
+            .max(1)
     }
 
     fn sum(&self, field: impl Fn(&ColumnWorker) -> &Arc<AtomicUsize>) -> usize {
