@@ -187,8 +187,7 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
 
             // Recomputed after every close: the byte-capped count changes once a
             // row group has been measured.
-            let max_rows_in_group_row =
-                self.max_rows_in_group_row.min(self.byte_capped_rows(batch));
+            let max_rows_in_group_row = self.max_rows_in_group_row.min(self.rows_that_fit(batch));
             let length = usize::min(
                 max_rows_in_group_row - self.buffered_rows,
                 batch.num_rows() - offset,
@@ -246,32 +245,39 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
         self.file_writer.flushed_row_groups()
     }
 
-    /// Rows a row group may hold to stay under [`Self::max_bytes_in_group_row`],
-    /// derived from the last row group that was closed; the first row group of a
-    /// file, having no earlier group to measure, is sized from the batch slice's
-    /// own memory rather than from the buffers it shares.
-    fn byte_capped_rows(&self, batch: &RecordBatch) -> usize {
+    /// The last row group's recorded size: parquet's uncompressed row-group size, the quantity
+    /// `get_estimated_total_bytes` estimates per column writer while a group is open. A file's
+    /// first row group has no earlier group to measure, so the batch slice's own memory stands
+    /// in — `get_array_memory_size` reports the whole backing buffer on a slice, so it is taken
+    /// from the slice's own share where arrow can provide it.
+    fn get_estimated_total_bytes(&self, batch: &RecordBatch) -> usize {
+        match self.file_writer.flushed_row_groups().last() {
+            Some(group) => group.total_byte_size().max(0) as usize,
+            None => batch
+                .columns()
+                .iter()
+                .map(|column| column.to_data().get_slice_memory_size().ok())
+                .sum::<Option<usize>>()
+                .unwrap_or_else(|| batch.get_array_memory_size()),
+        }
+    }
+
+    /// The rows that size covers, read from the same row group.
+    fn rows_in_previous_group(&self, batch: &RecordBatch) -> usize {
+        self.file_writer
+            .flushed_row_groups()
+            .last()
+            .map_or(batch.num_rows(), |group| group.num_rows() as usize)
+    }
+
+    /// Rows a row group may hold to stay under [`Self::max_bytes_in_group_row`], at that group's
+    /// bytes per row — the conversion `ArrowWriter::write` calls `rows_that_fit`.
+    fn rows_that_fit(&self, batch: &RecordBatch) -> usize {
         if self.max_bytes_in_group_row == usize::MAX {
             return usize::MAX;
         }
-        let (rows, bytes) = match self.file_writer.flushed_row_groups().last() {
-            Some(group) => (
-                group.num_rows() as usize,
-                group.total_byte_size().max(0) as usize,
-            ),
-            // `get_array_memory_size` on a slice reports the whole backing buffer,
-            // so seed from the slice's own share where arrow can provide it; else
-            // the first row group of a file lands far under the bound.
-            None => (
-                batch.num_rows(),
-                batch
-                    .columns()
-                    .iter()
-                    .map(|column| column.to_data().get_slice_memory_size().ok())
-                    .sum::<Option<usize>>()
-                    .unwrap_or_else(|| batch.get_array_memory_size()),
-            ),
-        };
+        let rows = self.rows_in_previous_group(batch);
+        let bytes = self.get_estimated_total_bytes(batch);
         ((self.max_bytes_in_group_row as u128 * rows as u128 / bytes.max(1) as u128)
             .min(usize::MAX as u128) as usize)
             .max(1)
