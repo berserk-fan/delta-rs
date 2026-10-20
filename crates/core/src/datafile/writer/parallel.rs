@@ -200,7 +200,9 @@ impl<W: AsyncFileWriter> ParallelArrowWriter<W> {
             offset += length;
 
             self.buffered_rows += length;
-            if self.buffered_rows >= max_rows_in_group_row {
+            if self.buffered_rows >= max_rows_in_group_row
+                || self.in_progress_size() >= self.max_bytes_in_group_row
+            {
                 self.close_row_group().await?;
             }
         }
