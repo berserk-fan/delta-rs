@@ -40,6 +40,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion_datasource::PartitionedFile;
 use delta_kernel::table_features::ColumnMappingMode;
+use object_store::path::Path;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -507,8 +508,9 @@ impl CdfLoadBuilder {
 
                 let mut new_part_values = spec_partition_values.clone();
                 new_part_values.extend(partition_values);
-                let mut part_file = PartitionedFile::new(action.path(), action.size()? as u64)
-                    .with_partition_values(new_part_values.clone());
+                let mut part_file =
+                    partitioned_file(Path::parse(action.path())?, action.size()? as u64)
+                        .with_partition_values(new_part_values.clone());
 
                 if let Some(access_plan) = create_file_scan_plan(
                     Arc::clone(&self.log_store.engine()),
@@ -1671,6 +1673,40 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The fixture's only data file has three row groups of 100 rows each. Version 2 deletes
+    /// rows 5, 150 and 299 with a deletion vector and version 3 deletes rows 99, 100 and 200,
+    /// so every row group and both edges of each row group boundary are covered. The expected
+    /// rows match Spark's `table_changes` for the same versions.
+    #[tokio::test]
+    async fn test_cdf_with_dv_on_multi_row_group_file() -> TestResult {
+        let ctx = SessionContext::new();
+        let table_path = Path::new("../test/tests/data/cdf-table-dv-multi-row-group");
+        let table_uri = Url::from_directory_path(std::fs::canonicalize(table_path)?).unwrap();
+        let table = DeltaTable::try_from_url(table_uri).await?;
+        let builder = table.scan_cdf().with_starting_version(2);
+        ctx.register_table("cdf", Arc::new(DeltaCdfTableProvider::try_new(builder)?))?;
+
+        let batches = ctx
+            .sql("SELECT id, _change_type, _commit_version FROM cdf")
+            .await?
+            .collect()
+            .await?;
+
+        assert_batches_sorted_eq! {[
+            "+-----+--------------+-----------------+",
+            "| id  | _change_type | _commit_version |",
+            "+-----+--------------+-----------------+",
+            "| 100 | delete       | 3               |",
+            "| 150 | delete       | 2               |",
+            "| 200 | delete       | 3               |",
+            "| 299 | delete       | 2               |",
+            "| 5   | delete       | 2               |",
+            "| 99  | delete       | 3               |",
+            "+-----+--------------+-----------------+",
+        ], &batches }
+        Ok(())
+    }
+
     /// Regression test for <https://github.com/delta-io/delta-rs/issues/4864>:
     /// the CDF scan must apply the DataFusion session's
     /// `datafusion.execution.parquet.metadata_size_hint` to its `ParquetSource`s so
@@ -1786,16 +1822,14 @@ pub(crate) mod tests {
                 range.end - range.start == METADATA_SIZE_HINT && parquet_sizes.contains(&range.end)
             };
             match op {
-                RecordedObjectStoreOperation::GetRange(kind, range)
-                    if matches!(kind, RecordedPathKind::Data | RecordedPathKind::Other) =>
-                {
-                    is_prefetch(range)
-                }
-                RecordedObjectStoreOperation::GetRanges(kind, ranges)
-                    if matches!(kind, RecordedPathKind::Data | RecordedPathKind::Other) =>
-                {
-                    ranges.iter().any(is_prefetch)
-                }
+                RecordedObjectStoreOperation::GetRange(
+                    RecordedPathKind::Data | RecordedPathKind::Other,
+                    range,
+                ) => is_prefetch(range),
+                RecordedObjectStoreOperation::GetRanges(
+                    RecordedPathKind::Data | RecordedPathKind::Other,
+                    ranges,
+                ) => ranges.iter().any(is_prefetch),
                 _ => false,
             }
         });
@@ -1805,6 +1839,54 @@ pub(crate) mod tests {
              ParquetSource (https://github.com/delta-io/delta-rs/issues/4864); recorded operations: {operations:?}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_cdf_with_escaped_partition_values() -> TestResult {
+        let delta_schema = TestSchemas::simple();
+        let table: DeltaTable = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(delta_schema.fields().cloned())
+            .with_partition_columns(["modified"])
+            .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
+            .await?;
+
+        let schema: Arc<Schema> = Arc::new(delta_schema.try_into_arrow()?);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("1"), Some("2"), Some("3")])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])),
+                Arc::new(StringArray::from(vec![
+                    Some("a b"),
+                    Some("a b"),
+                    Some("2024-01-01 12:00:00"),
+                ])),
+            ],
+        )?;
+        let table = table.write(vec![batch]).await?;
+        let (table, _) = table.delete().with_predicate("value = 1").await?;
+
+        let ctx = SessionContext::new();
+        let cdf_scan = table
+            .scan_cdf()
+            .with_starting_version(0)
+            .build(&ctx.state(), None)
+            .await?;
+        let mut batches = collect(cdf_scan, ctx.task_ctx()).await?;
+        let _: Vec<_> = batches.iter_mut().map(|b| b.remove_column(5)).collect();
+
+        assert_batches_sorted_eq! {[
+            "+----+-------+---------------------+--------------+-----------------+",
+            "| id | value | modified            | _change_type | _commit_version |",
+            "+----+-------+---------------------+--------------+-----------------+",
+            "| 1  | 1     | a b                 | delete       | 2               |",
+            "| 1  | 1     | a b                 | insert       | 1               |",
+            "| 2  | 2     | a b                 | insert       | 1               |",
+            "| 3  | 3     | 2024-01-01 12:00:00 | insert       | 1               |",
+            "+----+-------+---------------------+--------------+-----------------+",
+        ], &batches }
         Ok(())
     }
 
